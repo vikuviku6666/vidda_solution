@@ -28,17 +28,12 @@ open http://localhost:3000
 
 ## 📚 Documentation
 
-### 🎯 Getting Started
+### Essential Guides
+- **[README.md](README.md)** - Project overview and GitHub landing page
 - **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - One-page quick start guide
-- **[READY_TO_TEST.md](READY_TO_TEST.md)** - Complete testing instructions
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - Full system architecture
-
-### ⚡ Performance Optimizations
-- **[SESSION_SUMMARY.md](SESSION_SUMMARY.md)** - What we did (May 16, 2026)
-- **[OPTIMIZATIONS_DEPLOYED.md](OPTIMIZATIONS_DEPLOYED.md)** - Implementation details
-- **[BEFORE_AFTER_COMPARISON.md](BEFORE_AFTER_COMPARISON.md)** - Visual comparison
-- **[PERFORMANCE_IMPROVEMENTS.md](PERFORMANCE_IMPROVEMENTS.md)** - Strategy & roadmap
-- **[OPTIMIZATION_DIAGRAM.txt](OPTIMIZATION_DIAGRAM.txt)** - Visual diagrams
+- **[READY_TO_TEST.md](READY_TO_TEST.md)** - Complete testing instructions
+- **[INDEX.md](INDEX.md)** - This documentation index
 
 ---
 
@@ -245,19 +240,16 @@ NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
 
 ## 📖 Reading Order
 
-**For New Developers:**
-1. [ARCHITECTURE.md](ARCHITECTURE.md) - Understand the system
+**For New Users:**
+1. [README.md](README.md) - Project overview
 2. [QUICK_REFERENCE.md](QUICK_REFERENCE.md) - Get started quickly
-3. [SESSION_SUMMARY.md](SESSION_SUMMARY.md) - See recent changes
+3. [READY_TO_TEST.md](READY_TO_TEST.md) - Test the application
 
-**For Testing:**
-1. [READY_TO_TEST.md](READY_TO_TEST.md) - Complete testing guide
+**For Developers:**
+1. [ARCHITECTURE.md](ARCHITECTURE.md) - Understand the system
 2. [QUICK_REFERENCE.md](QUICK_REFERENCE.md) - Quick commands
-
-**For Performance Analysis:**
-1. [BEFORE_AFTER_COMPARISON.md](BEFORE_AFTER_COMPARISON.md) - Visual comparison
-2. [OPTIMIZATIONS_DEPLOYED.md](OPTIMIZATIONS_DEPLOYED.md) - Implementation
-3. [OPTIMIZATION_DIAGRAM.txt](OPTIMIZATION_DIAGRAM.txt) - Diagrams
+3. Backend code in `/backend-ADK/app/`
+4. Frontend code in `/frontend/my-app/app/`
 
 ---
 
@@ -276,13 +268,13 @@ NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
 ## 📬 Contact & Support
 
 For questions or issues:
-- Review documentation in this directory
-- Check troubleshooting sections
-- Review architecture diagrams
-- Examine performance logs
+- Review documentation: [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md)
+- Check [READY_TO_TEST.md](READY_TO_TEST.md) for troubleshooting
+- Open an issue on GitHub: https://github.com/vikuviku6666/vidda_solution
 
 ---
 
 **Last Updated:** May 16, 2026  
-**Version:** 1.1 (Optimized)  
-**Status:** Production-Ready (Pending Tests)
+**Version:** 1.1 (Optimized & Cleaned)  
+**Status:** Production-Ready (Pending Tests)  
+**Repository:** https://github.com/vikuviku6666/vidda_solution
