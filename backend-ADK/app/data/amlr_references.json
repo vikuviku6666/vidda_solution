@@ -1,0 +1,25 @@
+[
+  {
+    "article": "Article 12",
+    "title": "Awareness of requirements",
+    "requirements": [
+      "ongoing training",
+      "role-specific training"
+    ],
+    "keywords": [
+      "awareness",
+      "training",
+      "ongoing training",
+      "role-specific training",
+      "requirements",
+      "staff"
+    ],
+    "risk_types": [
+      "onboarding_risk",
+      "sanctions_risk",
+      "audit_trail_risk",
+      "escalation_risk",
+      "beneficial_ownership_risk"
+    ]
+  }
+]

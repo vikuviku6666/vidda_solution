@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-multipart
+langchain
+langchain-community
+langchain-text-splitters
+langgraph
+pypdf
+docx2txt
+openai
+python-dotenv
+sqlalchemy
+psycopg[binary]
