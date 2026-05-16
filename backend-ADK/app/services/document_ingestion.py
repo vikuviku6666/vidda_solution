@@ -2,18 +2,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from fastapi import UploadFile
-from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.services.audit import audit_log
 
 
-ALLOWED_EXTENSIONS = {
-    '.pdf': PyPDFLoader,
-    '.docx': Docx2txtLoader,
-    '.md': TextLoader,
-    '.txt': TextLoader,
-}
+ALLOWED_EXTENSIONS = {'.pdf', '.docx', '.md', '.txt'}
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
@@ -23,8 +16,7 @@ async def ingest_upload(file: UploadFile) -> dict:
     filename = file.filename or ''
     extension = Path(filename).suffix.lower()
 
-    loader_class = ALLOWED_EXTENSIONS.get(extension)
-    if loader_class is None:
+    if extension not in ALLOWED_EXTENSIONS:
         allowed = ', '.join(sorted(ALLOWED_EXTENSIONS))
         raise ValueError(f'Unsupported file type. Allowed extensions: {allowed}')
 
@@ -36,21 +28,12 @@ async def ingest_upload(file: UploadFile) -> dict:
             raise ValueError('Uploaded file is empty')
 
         temp_path.write_bytes(contents)
+        plain_text = _extract_text(temp_path, extension)
 
-        documents = loader_class(str(temp_path)).load()
-        for document in documents:
-            document.metadata['source'] = filename
+    if not plain_text.strip():
+        raise ValueError('No text could be extracted from the uploaded file')
 
-        plain_text = '\n\n'.join(document.page_content for document in documents)
-
-        if not plain_text.strip():
-            raise ValueError('No text could be extracted from the uploaded file')
-
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-        )
-        chunks = splitter.split_documents(documents)
+    chunks = _split_text(plain_text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
 
     result = {
         'filename': filename,
@@ -61,12 +44,8 @@ async def ingest_upload(file: UploadFile) -> dict:
         'chunk_overlap': CHUNK_OVERLAP,
         'chunk_count': len(chunks),
         'chunks': [
-            {
-                'index': index,
-                'text': chunk.page_content,
-                'metadata': chunk.metadata,
-            }
-            for index, chunk in enumerate(chunks)
+            {'index': i, 'text': chunk, 'metadata': {'source': filename}}
+            for i, chunk in enumerate(chunks)
         ],
     }
 
@@ -91,11 +70,57 @@ async def ingest_upload(file: UploadFile) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+def _extract_text(path: Path, extension: str) -> str:
+    """Extract plain text from a file using lightweight, dependency-minimal libs."""
+    if extension == '.pdf':
+        return _read_pdf(path)
+    if extension == '.docx':
+        return _read_docx(path)
+    # .txt and .md — plain UTF-8
+    return path.read_text(encoding='utf-8', errors='replace')
+
+
+def _read_pdf(path: Path) -> str:
+    try:
+        import pypdf  # already a direct dep
+        reader = pypdf.PdfReader(str(path))
+        pages = [page.extract_text() or '' for page in reader.pages]
+        return '\n\n'.join(pages)
+    except Exception as exc:
+        raise ValueError(f'Could not read PDF: {exc}') from exc
+
+
+def _read_docx(path: Path) -> str:
+    try:
+        import docx  # python-docx
+        doc = docx.Document(str(path))
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        return '\n\n'.join(paragraphs)
+    except Exception as exc:
+        raise ValueError(f'Could not read DOCX: {exc}') from exc
+
+
+def _split_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+    """Simple character-level sliding-window splitter (no LangChain required)."""
+    if not text:
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+
 def _safe_filename(filename: str, extension: str) -> str:
     stem = Path(filename).stem or 'upload'
     safe_stem = ''.join(
-        character if character.isalnum() or character in {'-', '_'} else '_'
-        for character in stem
+        c if c.isalnum() or c in {'-', '_'} else '_'
+        for c in stem
     ).strip('_')
-
     return f'{safe_stem or "upload"}{extension}'

@@ -1,5 +1,21 @@
+import asyncio
+import contextlib
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 from app.routes.audit import router as audit_router
 from app.routes.competencies import router as competencies_router
@@ -11,7 +27,29 @@ from app.routes.upload import router as upload_router
 from app.routes.workflow import router as workflow_router
 from app.routes.approval import router as approval_router
 
-app = FastAPI(title='Vidda API')
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup / shutdown lifecycle manager."""
+    # --- Startup ---
+    from app.db import create_tables
+    try:
+        create_tables()
+        logger.info("✅ Database tables created/verified")
+    except Exception as exc:
+        logger.warning(f"DB table creation skipped: {exc}")
+
+    try:
+        yield
+    except asyncio.CancelledError:
+        # Suppress the noisy CancelledError that uvicorn raises during Ctrl+C shutdown.
+        # The server has already stopped accepting connections at this point.
+        pass
+    finally:
+        # --- Shutdown ---
+        logger.info("Vidda API shutting down cleanly.")
+
+
+app = FastAPI(title='Vidda API', lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

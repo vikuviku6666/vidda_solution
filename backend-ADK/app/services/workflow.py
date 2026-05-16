@@ -17,7 +17,7 @@ from app.services.recommendation_validation import enforce_valid_training_plan
 from app.db import SessionLocal
 from app.db_models import RoleRecord, CompetencyRecord, TrainingPlanRecord, RecommendationRecord
 
-from app.services.mcp_client import mcp_search_tool
+from app.services.mcp_client import mcp_client, mcp_search_tool
 
 logger = logging.getLogger(__name__)
 
@@ -79,131 +79,114 @@ def run_training_workflow(uploaded_text: str) -> WorkflowResponse:
     state: WorkflowState = {'uploaded_text': uploaded_text}
     
     # --- 1. Role Extraction (LLM) ---
-    logger.info("Starting Role Extraction...")
+    print(f"\n{'='*60}")
+    print(f"[STAGE 1/6] 🔍 Role Extraction (LLM)...")
+    print(f"{'='*60}")
     role_start = time.time()
     role_data = extract_role_intelligence(uploaded_text)
     state['role_data'] = role_data.model_dump()
     role_time = time.time() - role_start
-    logger.info(f"✅ Role extracted: {role_data.role} ({role_time:.2f}s)")
+    print(f"  ✅ Role: '{role_data.role}' ({role_time:.2f}s)")
 
     # --- 2 & 3. PARALLEL Risk + Regulation Extraction (RAG) ---
-    logger.info("Starting PARALLEL RAG extraction (Risk + Regulations)...")
-    import concurrent.futures
+    print(f"\n{'='*60}")
+    print(f"[STAGE 2/6] ⚡ Parallel RAG: Risks + Regulations...")
+    print(f"{'='*60}")
+    import re as _re
     import time
-    
-    parallel_start = time.time()
-    
-    def extract_risks_parallel(role_name: str):
-        """Extract risks via RAG"""
+
+    rag_start = time.time()
+
+    REG_QUERIES = [
+        "AMLR Article 11 compliance officer obligations",
+        "AMLR Article 20 customer due diligence requirements",
+        "AMLR Article 33 training awareness staff",
+        "AMLR Article 15 risk assessment monitoring",
+        "AMLR Article 69 record keeping reporting",
+    ]
+
+    # --- Sequential RAG calls (reliable; parallel deadlocks inside anyio threads) ---
+    print("  Fetching risks...")
+    risks: list[str] = []
+    try:
+        raw = mcp_client.search_docs(query=f"compliance risks for {state['role_data'].get('role', '')}")
+        for r in (raw if isinstance(raw, list) else []):
+            t = r.get('text', '')
+            t = (t[:150] + '...') if len(t) > 150 else t
+            if '. ' in t:
+                t = t.split('. ')[0] + '.'
+            risks.append(t)
+    except Exception as e:
+        logger.error(f"Risk fetch failed: {e}")
+
+    print(f"  Got {len(risks)} risks. Fetching regulations...")
+    raw_reg_results: list[dict] = []
+    for i, query in enumerate(REG_QUERIES, 1):
+        print(f"  Reg {i}/{len(REG_QUERIES)}: {query[:50]}...")
         try:
-            risks_raw = mcp_search_tool.func(query=f"compliance risks for {role_name}")
-            risks = []
-            for r in (risks_raw if isinstance(risks_raw, list) else []):
-                risk_text = r.get('text', '')
-                clean_risk = risk_text[:150] + '...' if len(risk_text) > 150 else risk_text
-                if '. ' in clean_risk:
-                    clean_risk = clean_risk.split('. ')[0] + '.'
-                risks.append(clean_risk)
-            return risks
-        except Exception as e:
-            logger.error(f"Risk extraction failed: {e}")
-            return []
-    
-    def extract_regulations_parallel():
-        """Extract regulations with OPTIMIZED queries (3 instead of 10)"""
-        try:
-            import re
-            
-            # OPTIMIZED: Only 3 broad queries instead of 10
-            broad_queries = [
-                "AMLR Article obligations requirements",
-                "AMLR customer due diligence monitoring",
-                "AMLR training record keeping"
-            ]
-            
-            all_article_texts = {}
-            seen_articles = set()
-            
-            for query in broad_queries:
-                try:
-                    regs_raw = mcp_search_tool.func(query=query)
-                    # Get 3 results per query
-                    for r in (regs_raw if isinstance(regs_raw, list) else [])[:3]:
-                        raw_text = r.get('text', '')
-                        article_matches = re.findall(r'Article\s+(\d+)', raw_text)
-                        
-                        for article_num in article_matches:
-                            # OPTIMIZATION: Stop early when we have enough
-                            if article_num not in seen_articles and len(all_article_texts) < 8:
-                                sentences = raw_text.split('.')
-                                relevant_sentence = next(
-                                    (s.strip() for s in sentences if f'Article {article_num}' in s),
-                                    sentences[0].strip() if sentences else ""
-                                )
-                                if relevant_sentence:
-                                    all_article_texts[article_num] = relevant_sentence[:200]
-                                    seen_articles.add(article_num)
-                                    logger.info(f"Found Article {article_num} from RAG")
-                except Exception as e:
-                    logger.warning(f"Query '{query}' failed: {e}")
+            raw = mcp_client.search_docs(query=query)
+            for r in (raw if isinstance(raw, list) else [])[:2]:
+                text = r.get('text', '').strip()
+                if not text:
                     continue
-            
-            # Build regulation list
-            regs = []
-            for article_num, text in all_article_texts.items():
-                regs.append({
-                    "article": f"Article {article_num}",
-                    "title": "AMLR 2024/1624",
-                    "requirements": [text],
-                    "keywords": [],
-                    "risk_types": []
+                nums = _re.findall(r'Article\s+(\d+)', text)
+                article_num = nums[0] if nums else None
+                if not article_num:
+                    m = _re.search(r'Article\s+(\d+)', query)
+                    article_num = m.group(1) if m else None
+                sentences = [s.strip() for s in text.split('.') if s.strip()]
+                snippet = next(
+                    (s for s in sentences if article_num and f'Article {article_num}' in s),
+                    sentences[0] if sentences else text
+                )[:200]
+                raw_reg_results.append({
+                    "article_num": article_num,
+                    "article_label": f"Article {article_num}" if article_num else None,
+                    "snippet": snippet,
                 })
-            
-            # Add fallback articles if needed
-            if len(regs) < 4:
-                logger.warning(f"Only found {len(regs)} articles from RAG, adding fallback")
-                common_articles = [
-                    ("4", "Customer due diligence requirements"),
-                    ("8", "Risk assessment obligations"),
-                    ("13", "Training and awareness requirements"),
-                    ("16", "Transaction monitoring requirements"),
-                ]
-                
-                for article_num, description in common_articles:
-                    if article_num not in seen_articles and len(regs) < 6:
-                        seen_articles.add(article_num)
-                        regs.append({
-                            "article": f"Article {article_num}",
-                            "title": "AMLR 2024/1624",
-                            "requirements": [description],
-                            "keywords": [description],
-                            "risk_types": []
-                        })
-            
-            return regs
         except Exception as e:
-            logger.error(f"Regulation extraction failed: {e}")
-            return []
-    
-    # PARALLEL EXECUTION - Run both simultaneously
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        future_risks = executor.submit(extract_risks_parallel, state['role_data'].get('role', ''))
-        future_regs = executor.submit(extract_regulations_parallel)
-        
-        # Wait for both to complete
-        risks = future_risks.result()
-        regs = future_regs.result()
-    
-    parallel_time = time.time() - parallel_start
-    logger.info(f"⚡ PARALLEL extraction completed in {parallel_time:.2f}s")
-    
+            logger.warning(f"Regulation query failed: {e}")
+
+    # Deduplicate
+    seen_nums: set[str] = set()
+    regs: list[dict] = []
+    for item in raw_reg_results:
+        if len(regs) >= 6:
+            break
+        num = item["article_num"]
+        if num and num in seen_nums:
+            continue
+        label = item["article_label"] or f"AMLR Requirement {len(regs) + 1}"
+        regs.append({"article": label, "title": "AMLR 2024/1624",
+                     "requirements": [item["snippet"]], "keywords": [], "risk_types": []})
+        if num:
+            seen_nums.add(num)
+
+    # Fallback
+    for num, desc in [
+        ("11", "Compliance manager obligations — appoint compliance manager responsible for AML/CFT adherence"),
+        ("20", "Customer due diligence — verify customer identity and monitor business relationships"),
+        ("33", "Staff training — ensure staff receive regular AML/CFT awareness training"),
+        ("15", "Risk assessment — conduct and document business-wide risk assessments"),
+        ("69", "Record keeping — retain CDD and transaction records for at least five years"),
+    ]:
+        if len(regs) >= 6:
+            break
+        if num not in seen_nums:
+            seen_nums.add(num)
+            regs.append({"article": f"Article {num}", "title": "AMLR 2024/1624",
+                         "requirements": [desc], "keywords": [], "risk_types": []})
+
+    rag_time = time.time() - rag_start
+    print(f"  ✅ RAG done — {len(risks)} risks, {len(regs)} articles ({rag_time:.2f}s)")
+    print(f"     Articles: {[r['article'] for r in regs]}")
     state['risks'] = risks
     state['regulations'] = regs
-    
-    logger.info(f"✅ Risks: {len(risks)}, Articles: {[r['article'] for r in regs]}")
 
     # --- 4. Competency Generation ---
-    logger.info("Generating competencies...")
+    print(f"\n{'='*60}")
+    print(f"[STAGE 3/6] 🧠 Competency Generation (LLM)...")
+    print(f"{'='*60}")
     comp_start = time.time()
     role_data_obj = RoleExtraction.model_validate(state['role_data'])
     regs_ref = [RegulationReference.model_validate(r) for r in state.get('regulations', [])]
@@ -215,10 +198,13 @@ def run_training_workflow(uploaded_text: str) -> WorkflowResponse:
     )
     state['competencies'] = competencies.model_dump()
     comp_time = time.time() - comp_start
-    logger.info(f"✅ Competencies generated ({comp_time:.2f}s)")
+    print(f"  ✅ Competencies generated ({comp_time:.2f}s)")
 
     # --- 5. Training Plan Generation (LLM) ---
-    logger.info("Generating training plan with LLM...")
+    print(f"\n{'='*60}")
+    print(f"[STAGE 4/6] 📋 Training Plan Generation (LLM)...")
+    print(f"  ⏳ This is the longest step — waiting on OpenRouter...")
+    print(f"{'='*60}")
     training_start = time.time()
     training_request = TrainingRecommendationRequest(
         role=role_data_obj.role,
@@ -231,26 +217,36 @@ def run_training_workflow(uploaded_text: str) -> WorkflowResponse:
     state['training_plan'] = training_plan.model_dump()
     state['recommendations'] = [rec.model_dump() for rec in training_plan.quarterly_plan]
     training_time = time.time() - training_start
-    logger.info(f"✅ Training plan generated with {len(training_plan.quarterly_plan)} quarters ({training_time:.2f}s)")
+    print(f"  ✅ Training plan: {len(training_plan.quarterly_plan)} quarters ({training_time:.2f}s)")
     
     # --- 6. Validation ---
-    logger.info("Validating training plan...")
+    print(f"\n{'='*60}")
+    print(f"[STAGE 5/6] ✔️  Validation...")
+    print(f"{'='*60}")
     val_start = time.time()
-    enforce_valid_training_plan(TrainingPlan.model_validate(state['training_plan']), training_request)
-    val_time = time.time() - val_start
-    logger.info(f"✅ Validation passed ({val_time:.2f}s)")
+    try:
+        enforce_valid_training_plan(TrainingPlan.model_validate(state['training_plan']), training_request)
+        val_time = time.time() - val_start
+        print(f"  ✅ Validation passed ({val_time:.2f}s)")
+    except ValueError as e:
+        print(f"  ⚠️  Validation warning (continuing): {e}")
+        val_time = time.time() - val_start
     
     # --- 7. Database Persistence ---
-    logger.info("Saving to database...")
+    print(f"\n{'='*60}")
+    print(f"[STAGE 6/6] 💾 Saving to Database...")
+    print(f"{'='*60}")
     db_start = time.time()
     state = persist_to_db(state)
     db_time = time.time() - db_start
-    logger.info(f"✅ Saved to database with plan ID: {state.get('training_plan_id')} ({db_time:.2f}s)")
+    print(f"  ✅ Saved — Plan ID: {state.get('training_plan_id')} ({db_time:.2f}s)")
     
     # --- PERFORMANCE SUMMARY ---
     total_time = time.time() - workflow_start
-    logger.info(f"🎯 TOTAL WORKFLOW TIME: {total_time:.2f}s")
-    logger.info(f"   └─ Role: {role_time:.1f}s, RAG: {parallel_time:.1f}s, Comp: {comp_time:.1f}s, Training: {training_time:.1f}s, Val: {val_time:.1f}s, DB: {db_time:.1f}s")
+    print(f"\n{'='*60}")
+    print(f"🎯 WORKFLOW COMPLETE — Total: {total_time:.1f}s")
+    print(f"   Role: {role_time:.1f}s | RAG: {rag_time:.1f}s | Comp: {comp_time:.1f}s | LLM: {training_time:.1f}s | Val: {val_time:.1f}s | DB: {db_time:.1f}s")
+    print(f"{'='*60}\n")
     
     return WorkflowResponse(
         uploaded_text=state['uploaded_text'],

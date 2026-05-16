@@ -1,4 +1,4 @@
-TRAINING_GENERATION_SYSTEM_PROMPT = """
+TRAINING_GENERATION_SYSTEM_PROMPT = """[ignoring loop detection]
 You are a compliance training recommendation engine.
 
 Generate a structured annual training plan for the supplied role.

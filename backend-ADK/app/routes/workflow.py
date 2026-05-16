@@ -54,3 +54,8 @@ def get_training_plan(plan_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(exc),
         ) from exc
+
+@router.get('/workflow/health')
+def health_check():
+    """Simple health check endpoint"""
+    return {"status": "ok", "message": "Workflow service is running"}

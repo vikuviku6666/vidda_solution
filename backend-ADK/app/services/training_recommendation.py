@@ -15,7 +15,7 @@ from app.services.recommendation_validation import (
 )
 
 
-MAX_GENERATION_ATTEMPTS = 2
+MAX_GENERATION_ATTEMPTS = 1
 
 
 def generate_training_recommendations(
@@ -73,6 +73,7 @@ def _generate_training_plan(
     try:
         response = client.chat.completions.create(
             model=model_name,
+            max_tokens=8000,
             messages=[
                 {
                     'role': 'system',

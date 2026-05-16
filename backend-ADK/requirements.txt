@@ -1,13 +1,22 @@
+# Web framework
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
-langchain
-langchain-community
-langchain-text-splitters
-langgraph
-pypdf
-docx2txt
+
+# LLM / AI
 openai
-python-dotenv
+google-adk
+
+# Document parsing
+pypdf
+python-docx
+
+# HTTP client (MCP RAG calls)
+httpx
+
+# Database
 sqlalchemy
 psycopg[binary]
+
+# Config
+python-dotenv

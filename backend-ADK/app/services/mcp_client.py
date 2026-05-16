@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 import httpx
 from dotenv import load_dotenv
 
@@ -18,23 +19,33 @@ class MCPRAGClient:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream"
         }
-        self.client = httpx.Client(timeout=30.0)
-        
+        # Thread-local storage so each thread gets its own httpx.Client,
+        # avoiding connection-pool lock contention under concurrent calls.
+        self._local = threading.local()
+
         if self.api_key:
             self._initialize()
+
+    def _get_client(self) -> httpx.Client:
+        """Return a per-thread httpx.Client (created on first use in each thread)."""
+        if not hasattr(self._local, "client"):
+            self._local.client = httpx.Client(timeout=30.0)
+        return self._local.client
 
     def _post_jsonrpc(self, payload: dict) -> httpx.Response:
         headers = self.headers.copy()
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
-        
-        response = self.client.post(self.endpoint, json=payload, headers=headers)
+
+        client = self._get_client()
+        response = client.post(self.endpoint, json=payload, headers=headers)
         response.raise_for_status()
-        
+
         if not self.session_id and "Mcp-Session-Id" in response.headers:
             self.session_id = response.headers["Mcp-Session-Id"]
-            
+
         return response
+
 
     def _initialize(self):
         init_payload = {

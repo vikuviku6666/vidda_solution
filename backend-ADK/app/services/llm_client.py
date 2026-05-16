@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -20,10 +21,13 @@ def create_llm_client() -> OpenAI:
     if not base_url and os.getenv('OPENROUTER_API_KEY'):
         base_url = 'https://openrouter.ai/api/v1'
 
+    # Separate connect (10s) vs read (90s) timeouts.
+    # max_retries=1 avoids silent 2×90s waits when OpenRouter is slow.
+    _timeout = httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=5.0)
     if base_url:
-        return OpenAI(api_key=api_key, base_url=base_url)
+        return OpenAI(api_key=api_key, base_url=base_url, timeout=_timeout, max_retries=1)
 
-    return OpenAI(api_key=api_key)
+    return OpenAI(api_key=api_key, timeout=_timeout, max_retries=1)
 
 
 def llm_model_name() -> str:
