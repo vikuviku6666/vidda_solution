@@ -12,15 +12,23 @@ load_dotenv(BACKEND_DIR / '.env')
 load_dotenv(BACKEND_DIR / '.env.local', override=True)
 
 
-DATABASE_URL = os.getenv('DATABASE_URL')
+# Use DATABASE_URL from env, or fall back to local SQLite so hot-reload
+# subprocesses never crash when the shell variable isn't inherited.
+_raw_db_url = os.getenv('DATABASE_URL', '').strip()
+DATABASE_URL: str = _raw_db_url if _raw_db_url.startswith(('sqlite', 'postgresql', 'postgres', 'mysql')) \
+    else 'sqlite:///./vidda.db'
 
 
 class Base(DeclarativeBase):
     pass
 
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
-SessionLocal = sessionmaker(bind=engine) if engine else None
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    pool_pre_ping=True,
+)
+SessionLocal = sessionmaker(bind=engine)
 
 
 def get_session() -> Generator[Session, None, None]:

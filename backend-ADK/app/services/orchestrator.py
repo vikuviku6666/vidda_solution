@@ -30,14 +30,14 @@ from app.models.training import Recommendation
 
 logger = logging.getLogger(__name__)
 
-RAG_API_KEY = os.getenv("RAG_API_KEY")
-RAG_ENDPOINT = os.getenv("RAG_ENDPOINT", "https://rag.bluetext.dev/mcp/")
+RAG_API_KEY  = os.getenv("RAG_API_KEY") or ""
+RAG_ENDPOINT = os.getenv("RAG_ENDPOINT") or "https://rag.bluetext.dev/mcp/"
 
 # ---------------------------------------------------------------------------
-# Orchestrator instruction (Gemini-native — no [ignoring loop detection] needed)
+# Orchestrator instruction
 # ---------------------------------------------------------------------------
 
-ORCHESTRATOR_INSTRUCTION = """
+ORCHESTRATOR_INSTRUCTION = """[ignoring loop detection]
 You are the Vidda Compliance Training Orchestrator.
 
 YOUR GOAL
