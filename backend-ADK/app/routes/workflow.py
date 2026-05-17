@@ -55,6 +55,16 @@ def get_training_plan(plan_id: str):
             detail=str(exc),
         ) from exc
 
+@router.get('/workflow/plan/{plan_id}/evaluate')
+def evaluate_plan(plan_id: str):
+    """Score a saved plan across 5 dimensions."""
+    from app.services.plan_evaluation import evaluate_plan as _eval
+    result = _eval(plan_id)
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
 @router.get('/workflow/health')
 def health_check():
     """Simple health check endpoint"""

@@ -12,6 +12,7 @@ import ConfidenceBadge from "../components/ConfidenceBadge";
 import BehaviouralOutcomes from "../components/BehaviouralOutcomes";
 import GovernanceDashboard from "../components/GovernanceDashboard";
 import SavedPlansPanel from "../components/SavedPlansPanel";
+import PlanScorecard from "../components/PlanScorecard";
 import { Button } from "../components/ui/button";
 
 const quarters = [
@@ -358,10 +359,13 @@ export default function Home() {
                 </div>
               </div>
 
+              {/* Plan Quality Scorecard */}
+              <PlanScorecard planId={workflowData.training_plan_id} />
+
               {/* Approval Workflow */}
-              <ApprovalWorkflow 
-                planId={workflowData.training_plan_id} 
-                onPlanUpdated={() => fetchWorkflowStatus(workflowData.training_plan_id)} 
+              <ApprovalWorkflow
+                planId={workflowData.training_plan_id}
+                onPlanUpdated={() => fetchWorkflowStatus(workflowData.training_plan_id)}
               />
             </div>
           </section>
