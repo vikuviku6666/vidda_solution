@@ -59,3 +59,32 @@ def get_training_plan(plan_id: str):
 def health_check():
     """Simple health check endpoint"""
     return {"status": "ok", "message": "Workflow service is running"}
+
+
+@router.get('/workflow/plans')
+def list_plans():
+    """List all saved training plans (newest first)."""
+    from app.db import SessionLocal
+    from app.db_models import TrainingPlanRecord, RoleRecord, RecommendationRecord
+    if SessionLocal is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    with SessionLocal() as db:
+        plans = (
+            db.query(TrainingPlanRecord)
+            .order_by(TrainingPlanRecord.created_at.desc())
+            .all()
+        )
+        result = []
+        for p in plans:
+            role = db.query(RoleRecord).filter(RoleRecord.id == p.role_id).first()
+            module_count = db.query(RecommendationRecord).filter(
+                RecommendationRecord.training_plan_id == p.id
+            ).count()
+            result.append({
+                "plan_id":      p.id,
+                "role":         role.name if role else "Unknown",
+                "status":       p.status,
+                "module_count": module_count,
+                "created_at":   p.created_at.isoformat() if p.created_at else None,
+            })
+        return result

@@ -423,6 +423,8 @@ def revise_training_plan(plan_id: str, feedback: str) -> bool:
             
             response = client.chat.completions.create(
                 model=model_name,
+                max_tokens=16000,
+                temperature=0,
                 messages=[
                     {'role': 'system', 'content': TRAINING_GENERATION_SYSTEM_PROMPT},
                     {'role': 'user', 'content': json.dumps(payload, indent=2)},
