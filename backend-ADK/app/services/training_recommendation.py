@@ -73,7 +73,8 @@ def _generate_training_plan(
     try:
         response = client.chat.completions.create(
             model=model_name,
-            max_tokens=8000,
+            max_tokens=16000,
+            temperature=0,          # deterministic — same role → same plan
             messages=[
                 {
                     'role': 'system',

@@ -21,6 +21,7 @@ def extract_role_intelligence(document_text: str) -> RoleExtraction:
     try:
         response = client.chat.completions.create(
             model=model_name,
+            temperature=0,   # deterministic — same text → same extraction
             messages=[
                 {
                     'role': 'system',

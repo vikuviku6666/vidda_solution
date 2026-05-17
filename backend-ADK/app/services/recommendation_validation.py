@@ -70,10 +70,14 @@ def validate_training_plan(
         recommendation.quarter
         for recommendation in training_plan.quarterly_plan
     ]
-    if returned_quarters != REQUIRED_QUARTERS:
+    # Allow multiple modules per quarter: just check all 4 are present at least once
+    returned_quarter_set = set(returned_quarters)
+    missing_quarters = [q for q in REQUIRED_QUARTERS if q not in returned_quarter_set]
+    if missing_quarters:
         errors.append(
-            'Training plan must contain exactly Q1 Foundation, Q2 Application, '
-            'Q3 Deepening, and Q4 Embedding in order'
+            f'Training plan is missing quarters: {", ".join(missing_quarters)}. '
+            'Must contain at least one module for each of: Q1 Foundation, Q2 Application, '
+            'Q3 Deepening, Q4 Embedding'
         )
 
     evidence = build_evidence(request)

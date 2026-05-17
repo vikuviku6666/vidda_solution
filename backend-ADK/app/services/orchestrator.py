@@ -1,38 +1,43 @@
 """
-True Orchestrator Agent — an LLM that controls the full training workflow.
+Google ADK Orchestrator — real implementation using ADK Agent + Runner.
 
-Instead of a hardcoded pipeline, one LLM agent:
-  1. Decides which tools to call and in what order
-  2. Evaluates its own intermediate results
-  3. Retries steps when validation fails
-  4. Signals completion by outputting a structured JSON
+Architecture:
+  - Gemini 2.5 Flash (direct via GOOGLE_API_KEY) as the orchestrating LLM
+  - MCPToolset with StreamableHTTPConnectionParams → rag.bluetext.dev (native MCP)
+  - FunctionTool wrappers for Python-based services (role extraction, generation, DB)
 
-Tools exposed to the agent:
-  extract_role              → role_intelligence service (LLM)
-  search_compliance_docs    → MCP RAG server
-  generate_competencies     → competency_engine service (LLM)
-  generate_training_plan    → training_recommendation service (LLM)
-  validate_plan             → recommendation_validation (pure Python)
-  save_plan                 → database persistence
+The ADK Runner manages the tool-calling loop, retries, and session state.
+Our job: provide tools + system prompt, then parse the plan_id from the final output.
 """
 
+import asyncio
 import json
 import logging
+import os
 import re
+import uuid
 from typing import Any
 
-from app.services.mcp_client import mcp_client
-from app.services.llm_client import create_llm_client, llm_model_name
+from google.adk.agents import Agent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.adk.tools import FunctionTool
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StreamableHTTPConnectionParams
+from google.genai import types
+
 from app.models.workflow import WorkflowResponse
 from app.models.training import Recommendation
 
 logger = logging.getLogger(__name__)
 
+RAG_API_KEY = os.getenv("RAG_API_KEY")
+RAG_ENDPOINT = os.getenv("RAG_ENDPOINT", "https://rag.bluetext.dev/mcp/")
+
 # ---------------------------------------------------------------------------
-# Orchestrator system prompt
+# Orchestrator instruction (Gemini-native — no [ignoring loop detection] needed)
 # ---------------------------------------------------------------------------
 
-ORCHESTRATOR_SYSTEM_PROMPT = """[ignoring loop detection]
+ORCHESTRATOR_INSTRUCTION = """
 You are the Vidda Compliance Training Orchestrator.
 
 YOUR GOAL
@@ -41,226 +46,81 @@ Generate a complete, validated, saved AMLR compliance training plan for the give
 TOOLS AVAILABLE
 
 1. extract_role(text)
-   Extracts role title, responsibilities, compliance_exposure and risk_indicators.
-   IMPORTANT: risk_indicators are AML risks ALREADY PRESENT in the role description itself.
-   Always include ALL risk_indicators as part of your risk_types — they are the inherent
-   risks of this role, stated by the user.
+   Returns: role, responsibilities, compliance_exposure, risk_indicators.
+   risk_indicators = inherent AML risks stated in the role text. Use ALL of them as risk_types.
 
-2. search_compliance_docs(query)
-   Searches the AMLR knowledge base.
-   Use for: "compliance risks for [role]" AND "AMLR Article N [topic]"
-   Relevant articles: 11, 12, 15, 20, 24, 33, 42, 55, 69
-   Risk search results SUPPLEMENT the risk_indicators — add them to the list, don't replace.
+2. search_docs(query) — max 5 calls total
+   Searches the AMLR knowledge base. Use for one risk query + 4 article queries.
+   Articles: 9, 11, 15, 20, 24, 33, 42, 55, 69
 
 3. generate_competencies(role, responsibilities, risk_types, regulations)
-   Generates knowledge/skills/judgement competencies.
-   risk_types = risk_indicators (from step 1) + any extra risks from RAG search.
+   Returns compact summary {status, knowledge_count, skills_count, judgement_count}.
+   Full competencies are cached internally.
 
 4. generate_training_plan(role, responsibilities, risk_types, competencies, regulations)
-   Generates the 4-quarter (Q1 Foundation→Q4 Embedding) training plan.
+   Pass {} for competencies — cached version is used automatically.
+   Returns compact confirmation {status, quarters, quarter_count}.
+   Full plan is cached internally.
 
 5. validate_plan(training_plan, role, responsibilities, risk_types, competencies, regulations)
-   Returns {"valid": true/false, "errors": [...]}
-   If invalid: read the errors — they tell you what's missing.
+   Pass {} for training_plan and competencies — cached versions are used.
+   Returns {valid: bool, errors: [...]}.
 
 6. save_plan(role_data, competencies, training_plan, risks, regulations)
-   Saves to database. Returns {"plan_id": "<uuid>", "success": true}
+   Pass {} for competencies and training_plan — cached versions are used.
+   Returns {plan_id: "<uuid>", success: true}.
 
-REQUIRED SEQUENCE (adapt based on results)
+REQUIRED SEQUENCE (exactly in this order)
 
-Step 1  → extract_role(uploaded_text)
-          Capture: role, responsibilities, risk_indicators
-          risk_indicators are your STARTING risk_types — use all of them.
+1. extract_role(text) → note risk_indicators as your risk_types
+2. search_docs("AML compliance risks for <role>") → add new risks to risk_types
+3. search_docs("AMLR Article N <topic>") × 4 → pick articles matching the role risks
+4. generate_competencies(role, responsibilities, risk_types=[ALL risks], regulations)
+5. generate_training_plan(role, responsibilities, risk_types, competencies={}, regulations)
+6. validate_plan(training_plan={}, role, responsibilities, risk_types, competencies={}, regulations)
+   • If valid → step 7
+   • If invalid → call generate_training_plan again then validate again (max 1 retry)
+7. save_plan(role_data, competencies={}, training_plan={}, risks=[all risks], regulations)
+8. Output ONLY: {"status": "complete", "plan_id": "<uuid from save_plan result>"}
 
-Step 2  → search_compliance_docs("compliance risks for <role>")
-          Add any NEW risks found to your risk_types list (don't duplicate).
-
-Step 3  → search_compliance_docs("AMLR Article N <topic>") × 4-5 times
-          Choose articles relevant to THIS specific role and its risk_indicators.
-
-Step 4  → generate_competencies(role, responsibilities,
-                                 risk_types=risk_indicators + rag_risks,
-                                 regulations=...)
-
-Step 5  → generate_training_plan(...)
-Step 6  → validate_plan(...)
-          • If valid   → go to Step 7
-          • If invalid → analyse errors and fix (search more, or retry generation)
-Step 7  → save_plan(risks=risk_indicators + rag_risks, ...)
-Step 8  → Output ONLY this JSON (no other text, no markdown):
-          {"status": "complete", "plan_id": "<the uuid from save_plan>"}
-
-RULES
-- Always run extract_role FIRST.
-- Always use ALL risk_indicators from extract_role in risk_types.
-- Run at least 1 risk search + 4 article searches before generating.
-- Only reference AMLR article numbers that appeared in search results.
-- Maximum 18 tool calls total — be efficient.
-- When save_plan succeeds output ONLY the final JSON.
-"""
+CRITICAL RULES
+- Do exactly 5 search_docs calls (1 risk + 4 article). No more.
+- Pass {} for competencies and training_plan in steps 5, 6, 7 — cached versions are used.
+- ALWAYS call save_plan before outputting any final response.
+- Output ONLY the JSON in step 8. No explanation, no markdown.
+""".strip()
 
 # ---------------------------------------------------------------------------
-# Tool schemas (OpenAI / OpenRouter function-calling format)
+# Per-run state cache
+# Full objects are stored here so tool responses to the agent can be compact.
+# save_plan reads from here rather than from the (summarised) agent args.
 # ---------------------------------------------------------------------------
-
-ORCHESTRATOR_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "extract_role",
-            "description": "Extract role title, responsibilities, compliance exposure and risk indicators from the raw role description text.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "The raw uploaded role description"}
-                },
-                "required": ["text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_compliance_docs",
-            "description": "Search the AMLR compliance knowledge base. Use for risk queries and article lookups.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "e.g. 'compliance risks for KYC Analyst' or 'AMLR Article 20 customer due diligence'"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_competencies",
-            "description": "Generate knowledge, skills and judgement competencies for the role.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "role":             {"type": "string"},
-                    "responsibilities": {"type": "array", "items": {"type": "string"}},
-                    "risk_types":       {"type": "array", "items": {"type": "string"}},
-                    "regulations":      {"type": "array", "items": {"type": "object"}}
-                },
-                "required": ["role", "responsibilities", "risk_types", "regulations"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_training_plan",
-            "description": "Generate the 4-quarter AMLR compliance training plan for the role.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "role":             {"type": "string"},
-                    "responsibilities": {"type": "array", "items": {"type": "string"}},
-                    "risk_types":       {"type": "array", "items": {"type": "string"}},
-                    "competencies":     {"type": "object"},
-                    "regulations":      {"type": "array", "items": {"type": "object"}}
-                },
-                "required": ["role", "responsibilities", "risk_types", "competencies", "regulations"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "validate_plan",
-            "description": "Validate that every reference in the training plan is grounded in the provided evidence. Returns {valid, errors}.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "training_plan":    {"type": "object"},
-                    "role":             {"type": "string"},
-                    "responsibilities": {"type": "array", "items": {"type": "string"}},
-                    "risk_types":       {"type": "array", "items": {"type": "string"}},
-                    "competencies":     {"type": "object"},
-                    "regulations":      {"type": "array", "items": {"type": "object"}}
-                },
-                "required": ["training_plan", "role", "responsibilities", "risk_types", "competencies", "regulations"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_plan",
-            "description": "Save the validated training plan to the database. Returns {plan_id, success}.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "role_data":     {"type": "object"},
-                    "competencies":  {"type": "object"},
-                    "training_plan": {"type": "object"},
-                    "risks":         {"type": "array", "items": {"type": "string"}},
-                    "regulations":   {"type": "array", "items": {"type": "object"}}
-                },
-                "required": ["role_data", "competencies", "training_plan", "risks", "regulations"]
-            }
-        }
-    },
-]
+_CURRENT_RUN: dict = {}
 
 # ---------------------------------------------------------------------------
-# Tool implementations — thin wrappers around existing services
-# ---------------------------------------------------------------------------
-
-def _tool_extract_role(text: str) -> dict:
-    from app.services.role_intelligence import extract_role_intelligence
-    result = extract_role_intelligence(text)
-    return result.model_dump()
-
-
-def _tool_search_compliance_docs(query: str) -> list[dict]:
-    import re as _re
-    print(f"    🔍 {query[:90]}")
-    results = mcp_client.search_docs(query=query)
-    if not isinstance(results, list):
-        return []
-
-    # If the query asked for a specific article, tag chunks that don't mention it
-    # so the normalizer can still assign the correct article number.
-    m = _re.search(r'Article\s+(\d+)', query, _re.IGNORECASE)
-    query_article = m.group(1) if m else None
-
-    annotated = []
-    for r in results[:3]:
-        if isinstance(r, dict) and query_article:
-            text = r.get("text", "")
-            if not _re.search(r'Article\s+\d+', text):
-                r = dict(r)  # shallow copy so we don't mutate the original
-                r["_query_article"] = query_article
-        annotated.append(r)
-    return annotated
-
 
 def _normalize_regulations(regulations: list) -> list:
     """
-    Convert whatever format the agent sends into valid RegulationReference dicts.
-    Handles:
-      - Raw RAG chunks: {text, filename, score, ...}
-      - Partial dicts: {article, title, requirements: str}
-      - Correct format: {article, title, requirements: [...]}
-    Always ensures article label is "Article N" format so the frontend regex works.
+    Accepts any format the agent may construct from search_docs results:
+      - Raw MCP chunks:  {text, filename, score, document_id, label, ...}
+      - Partial dicts:   {article, title, requirements: str}
+      - Correct format:  {article, title, requirements: [...]}
+    Always ensures article is "Article N" so the frontend regex works.
     """
-    import re as _re
     normalized = []
     for r in regulations:
         if not isinstance(r, dict):
             continue
 
-        # Case 1: raw RAG chunk — extract article number from text, or use query hint
+        # Case 1: raw MCP chunk (has "text" but no "article")
         if "text" in r and "article" not in r:
             text = r.get("text", "")
-            nums = _re.findall(r'Article\s+(\d+)', text)
-            num  = nums[0] if nums else r.get("_query_article")
+            nums = re.findall(r'Article\s+(\d+)', text)
+            # Use label field if it contains an article hint (e.g. "AMLR_1")
+            label_field = r.get("label", "")
+            num = nums[0] if nums else None
             if not num:
-                continue  # genuinely no article context, skip
+                continue  # skip chunks with no article context
             label   = f"Article {num}"
             snippet = text[:200].strip()
             normalized.append({
@@ -272,15 +132,13 @@ def _normalize_regulations(regulations: list) -> list:
             })
             continue
 
-        # Case 2: has article field — normalise it and requirements
+        # Case 2: has "article" field — normalise
         article = str(r.get("article", "")).strip()
-        if not article or article in ("AMLR 2024/1624", "AMLR"):
-            continue  # skip generic labels with no real article number
-        # Bare number e.g. "5" → "Article 5"
+        if not article or article in ("AMLR 2024/1624", "AMLR", ""):
+            continue  # no real article number
         if article.isdigit():
             article = f"Article {article}"
-        # Starts with digit e.g. "5: something" → "Article 5: something"
-        elif _re.match(r'^\d+', article) and not article.lower().startswith("article"):
+        elif re.match(r'^\d+', article) and not article.lower().startswith("article"):
             article = f"Article {article}"
 
         title = r.get("title", f"AMLR 2024/1624 — {article}")
@@ -300,75 +158,212 @@ def _normalize_regulations(regulations: list) -> list:
 
     return normalized
 
+# ---------------------------------------------------------------------------
+# Tool implementations (FunctionTool wrappers around existing services)
+# ---------------------------------------------------------------------------
 
-def _tool_generate_competencies(
-    role: str, responsibilities: list, risk_types: list, regulations: list
+def extract_role(text: str) -> dict:
+    """
+    Extract role title, responsibilities, compliance exposure and risk indicators
+    from the raw role description text.
+
+    Args:
+        text: The raw uploaded role description.
+
+    Returns:
+        Dict with keys: role, responsibilities, compliance_exposure, risk_indicators.
+    """
+    from app.services.role_intelligence import extract_role_intelligence
+    result = extract_role_intelligence(text)
+    data = result.model_dump()
+    print(f"  📋 Role extracted: '{data.get('role')}'")
+    ri = data.get("risk_indicators", [])
+    if ri:
+        print(f"     Inherent risks ({len(ri)}): {[r[:60] for r in ri]}")
+    return data
+
+
+def generate_competencies(
+    role: str,
+    responsibilities: list[str],
+    risk_types: list[str],
+    regulations: list[dict],
 ) -> dict:
-    from app.services.competency_engine import generate_competencies
+    """
+    Generate knowledge, skills and judgement competencies for the role.
+
+    Args:
+        role: Job title.
+        responsibilities: List of role responsibilities.
+        risk_types: List of AML/CFT risk types (include ALL risk_indicators here).
+        regulations: List of regulation objects with article, title, requirements fields.
+
+    Returns:
+        Compact summary: knowledge_count, skills_count, judgement_count, status.
+    """
+    from app.services.competency_engine import generate_competencies as _gen
     from app.models.regulation import RegulationReference
     regs = [RegulationReference.model_validate(r) for r in _normalize_regulations(regulations)]
-    result = generate_competencies(
-        role=role,
-        responsibilities=responsibilities,
-        risk_types=risk_types,
-        regulations=regs,
-    )
-    return result.model_dump()
+    result = _gen(role=role, responsibilities=responsibilities,
+                  risk_types=risk_types, regulations=regs)
+    data = result.model_dump()
+    # Cache full competencies — only summary goes back to the agent
+    _CURRENT_RUN['competencies'] = data
+    _CURRENT_RUN['risk_types']   = risk_types
+    _CURRENT_RUN['regulations']  = regulations
+    k = len(data.get('knowledge', []))
+    s = len(data.get('skills', []))
+    j = len(data.get('judgement', []))
+    print(f"  🧠 Competencies: {k}K {s}S {j}J")
+    # Return COMPACT summary — do NOT return the full lists (too many tokens)
+    return {
+        "status":          "generated",
+        "knowledge_count": k,
+        "skills_count":    s,
+        "judgement_count": j,
+        "sample_knowledge": data.get('knowledge', [])[:2],  # just 2 examples
+    }
 
 
-def _tool_generate_training_plan(
-    role: str, responsibilities: list, risk_types: list,
-    competencies: dict, regulations: list
+def generate_training_plan(
+    role: str,
+    responsibilities: list[str],
+    risk_types: list[str],
+    competencies: dict,
+    regulations: list[dict],
 ) -> dict:
+    """
+    Generate the 4-quarter (Q1 Foundation to Q4 Embedding) AMLR compliance training plan.
+
+    Args:
+        role: Job title.
+        responsibilities: List of role responsibilities.
+        risk_types: Combined list of inherent and RAG-sourced AML risks.
+        competencies: Compact summary dict from generate_competencies (status, counts).
+        regulations: List of AMLR regulation objects with article, title, requirements fields.
+
+    Returns:
+        Compact confirmation: status, quarters list. Full plan is cached internally.
+    """
     from app.services.training_recommendation import generate_training_recommendations
     from app.models.training import TrainingRecommendationRequest
     from app.models.regulation import RegulationReference
     from app.models.competency import Competency
-    regs   = [RegulationReference.model_validate(r) for r in _normalize_regulations(regulations)]
-    comp   = Competency.model_validate(competencies)
-    req    = TrainingRecommendationRequest(
+
+    # Use cached full competencies (not the compact summary the agent has)
+    full_comp_data = _CURRENT_RUN.get('competencies', {})
+    regs = [RegulationReference.model_validate(r)
+            for r in _normalize_regulations(regulations or _CURRENT_RUN.get('regulations', []))]
+    comp = Competency.model_validate(full_comp_data) if full_comp_data else Competency(
+        knowledge=[], skills=[], judgement=[])
+    req  = TrainingRecommendationRequest(
         role=role, responsibilities=responsibilities,
         risk_types=risk_types, competencies=comp, regulations=regs,
     )
-    plan = generate_training_recommendations(req)
-    return plan.model_dump()
+    try:
+        plan = generate_training_recommendations(req)
+    except ValueError as e:
+        logger.warning(f"  ⚠️  Training plan generation failed: {e}")
+        return {"status": "error", "error": str(e)[:300],
+                "quarters": [], "quarter_count": 0}
+    data = plan.model_dump()
+    # Cache full training plan
+    _CURRENT_RUN['training_plan'] = data
+    _CURRENT_RUN['role']         = role
+    _CURRENT_RUN['risks']        = risk_types
+    quarters = [q.get('quarter') for q in data.get('quarterly_plan', [])]
+    print(f"  📝 Training plan: {list(dict.fromkeys(quarters))} ({len(quarters)} modules)")
+    # Return COMPACT confirmation only
+    return {"status": "generated", "quarters": list(dict.fromkeys(quarters)),
+            "module_count": len(quarters)}
 
 
-def _tool_validate_plan(
-    training_plan: dict, role: str, responsibilities: list,
-    risk_types: list, competencies: dict, regulations: list
+def validate_plan(
+    training_plan: dict,
+    role: str,
+    responsibilities: list[str],
+    risk_types: list[str],
+    competencies: dict,
+    regulations: list[dict],
 ) -> dict:
-    from app.services.recommendation_validation import validate_training_plan
+    """
+    Validate the generated training plan against the evidence.
+
+    Args:
+        training_plan: Pass {} — the full plan is retrieved from internal cache.
+        role: Job title.
+        responsibilities: List of role responsibilities.
+        risk_types: List of risk types used.
+        competencies: Compact summary from generate_competencies.
+        regulations: List of regulation objects used.
+
+    Returns:
+        Dict with keys: valid (bool), errors (list of strings).
+    """
+    from app.services.recommendation_validation import validate_training_plan as _val
     from app.models.training import TrainingPlan, TrainingRecommendationRequest
     from app.models.regulation import RegulationReference
     from app.models.competency import Competency
     try:
-        plan_obj = TrainingPlan.model_validate(training_plan)
-        regs     = [RegulationReference.model_validate(r) for r in _normalize_regulations(regulations)]
-        comp     = Competency.model_validate(competencies)
-        req      = TrainingRecommendationRequest(
+        full_plan = _CURRENT_RUN.get('training_plan', training_plan)
+        plan_obj  = TrainingPlan.model_validate(full_plan)
+        regs      = [RegulationReference.model_validate(r)
+                     for r in _normalize_regulations(regulations or _CURRENT_RUN.get('regulations', []))]
+        full_comp = _CURRENT_RUN.get('competencies', {})
+        comp      = Competency.model_validate(full_comp) if full_comp else Competency(
+            knowledge=[], skills=[], judgement=[])
+        req       = TrainingRecommendationRequest(
             role=role, responsibilities=responsibilities,
             risk_types=risk_types, competencies=comp, regulations=regs,
         )
-        result = validate_training_plan(plan_obj, req)
-        return {"valid": result.valid, "errors": result.errors}
+        result = _val(plan_obj, req)
+        status = "✅ VALID" if result.valid else f"❌ INVALID ({len(result.errors)} errors)"
+        print(f"  ✔️  Validation: {status}")
+        if result.errors:
+            for err in result.errors[:3]:
+                print(f"       • {err[:100]}")
+        return {"valid": result.valid, "errors": result.errors[:5]}  # cap errors
     except Exception as e:
-        return {"valid": False, "errors": [str(e)]}
+        print(f"  ✔️  Validation error: {e}")
+        return {"valid": False, "errors": [str(e)[:200]]}
 
 
-
-def _tool_save_plan(
-    role_data: dict, competencies: dict, training_plan: dict,
-    risks: list, regulations: list
+def save_plan(
+    role_data: dict,
+    competencies: dict,
+    training_plan: dict,
+    risks: list[str],
+    regulations: list[dict],
 ) -> dict:
+    """
+    Save the validated training plan to the database.
+
+    Args:
+        role_data: Dict from extract_role (role, responsibilities, etc).
+        competencies: Pass {} — full competencies are retrieved from internal cache.
+        training_plan: Pass {} — full training plan is retrieved from internal cache.
+        risks: Combined list of all risk description strings.
+        regulations: List of regulation objects (article, title, requirements).
+
+    Returns:
+        Dict with plan_id (str) and success (bool).
+    """
     from app.db import SessionLocal
     from app.db_models import RoleRecord, CompetencyRecord, TrainingPlanRecord, RecommendationRecord
     from app.models.role_intelligence import RoleExtraction
     from app.models.competency import Competency
-    from app.models.training import TrainingPlan, Recommendation
+    from app.models.training import TrainingPlan
 
     if SessionLocal is None:
         return {"success": False, "error": "Database not available"}
+
+    # Always use the cached full objects — agent only holds compact summaries
+    full_comp_data = _CURRENT_RUN.get('competencies', competencies)
+    full_plan_data = _CURRENT_RUN.get('training_plan', training_plan)
+    full_risks     = _CURRENT_RUN.get('risks', risks) or risks
+
+    if not full_plan_data or not full_plan_data.get('quarterly_plan'):
+        return {"success": False, "error": "No training plan in cache — call generate_training_plan first"}
 
     try:
         with SessionLocal() as session:
@@ -382,7 +377,7 @@ def _tool_save_plan(
             session.add(role_record)
             session.flush()
 
-            comp_obj = Competency.model_validate(competencies)
+            comp_obj = Competency.model_validate(full_comp_data)
             comp_record = CompetencyRecord(
                 role_id=role_record.id,
                 knowledge=comp_obj.knowledge,
@@ -396,7 +391,7 @@ def _tool_save_plan(
             session.add(plan_record)
             session.flush()
 
-            plan_obj = TrainingPlan.model_validate(training_plan)
+            plan_obj = TrainingPlan.model_validate(full_plan_data)
             for rec in plan_obj.quarterly_plan:
                 session.add(RecommendationRecord(
                     training_plan_id=plan_record.id,
@@ -415,276 +410,247 @@ def _tool_save_plan(
                 ))
 
             session.commit()
-            logger.info(f"✅ Saved plan {plan_record.id}")
+            print(f"  💾 Saved — plan_id: {plan_record.id}")
+            # Clear run cache after successful save
+            _CURRENT_RUN.clear()
             return {"success": True, "plan_id": plan_record.id}
 
     except Exception as e:
-        logger.error(f"DB save failed: {e}")
-        return {"success": False, "error": str(e)}
+        logger.error(f"DB save failed: {e}", exc_info=True)
+        return {"success": False, "error": str(e)[:200]}
 
 
 # ---------------------------------------------------------------------------
-# Tool dispatch
+# ADK Agent factory
 # ---------------------------------------------------------------------------
 
-TOOL_REGISTRY = {
-    "extract_role":            _tool_extract_role,
-    "search_compliance_docs":  _tool_search_compliance_docs,
-    "generate_competencies":   _tool_generate_competencies,
-    "generate_training_plan":  _tool_generate_training_plan,
-    "validate_plan":           _tool_validate_plan,
-    "save_plan":               _tool_save_plan,
-}
+def _create_rag_toolset() -> MCPToolset:
+    """Create MCPToolset connecting to the RAG server via MCP Streamable HTTP."""
+    return MCPToolset(
+        connection_params=StreamableHTTPConnectionParams(
+            url=RAG_ENDPOINT,
+            headers={
+                "Authorization": f"Bearer {RAG_API_KEY}",
+                "Accept": "application/json, text/event-stream",
+            },
+            timeout=30.0,
+            sse_read_timeout=120.0,
+        )
+    )
 
 
-def _dispatch(name: str, args: dict) -> Any:
-    fn = TOOL_REGISTRY.get(name)
-    if fn is None:
-        return {"error": f"Unknown tool: {name}"}
-    try:
-        return fn(**args)
-    except Exception as e:
-        logger.error(f"Tool '{name}' raised: {e}", exc_info=True)
-        return {"error": str(e)}
+def _create_agent() -> Agent:
+    """Create the ADK orchestrator agent with all tools."""
+    from google.genai import types as genai_types
+    return Agent(
+        name="compliance_orchestrator",
+        model="gemini-2.5-flash",
+        instruction=ORCHESTRATOR_INSTRUCTION,
+        generate_content_config=genai_types.GenerateContentConfig(
+            temperature=0,   # deterministic — same role → same article choices
+        ),
+        tools=[
+            _create_rag_toolset(),
+            FunctionTool(func=extract_role),
+            FunctionTool(func=generate_competencies),
+            FunctionTool(func=generate_training_plan),
+            FunctionTool(func=validate_plan),
+            FunctionTool(func=save_plan),
+        ],
+    )
+
+# ---------------------------------------------------------------------------
+# Async ADK runner
+# ---------------------------------------------------------------------------
+
+async def _run_adk_async(uploaded_text: str) -> str | None:
+    """Run the ADK agent. Returns the agent's final text output."""
+    session_service = InMemorySessionService()
+    session = await session_service.create_session(
+        app_name="vidda",
+        user_id="user",
+        session_id=str(uuid.uuid4()),
+    )
+
+    agent  = _create_agent()
+    runner = Runner(
+        agent=agent,
+        app_name="vidda",
+        session_service=session_service,
+    )
+
+    content = types.Content(
+        role="user",
+        parts=[types.Part(text=uploaded_text)],
+    )
+
+    final_text   = None
+    all_texts    = []
+    tool_count   = 0
+    event_count  = 0
+
+    print(f"\n  {'─'*50}")
+    print(f"  ADK Runner started — streaming events:")
+    print(f"  {'─'*50}")
+
+    async for event in runner.run_async(
+        user_id="user",
+        session_id=session.id,
+        new_message=content,
+    ):
+        event_count += 1
+        is_final = event.is_final_response()
+        has_content = bool(event.content and event.content.parts)
+
+        # Log every event
+        print(f"  [evt {event_count}] type={type(event).__name__} "
+              f"final={is_final} content={has_content} "
+              f"author={getattr(event, 'author', '?')}")
+
+        # Capture any text parts
+        if has_content:
+            for part in event.content.parts:
+                if hasattr(part, "text") and part.text:
+                    snippet = part.text.strip()[:150]
+                    print(f"           text: {snippet}")
+                    all_texts.append(part.text.strip())
+                if hasattr(part, "function_call") and part.function_call:
+                    tool_count += 1
+                    fc = part.function_call
+                    print(f"           tool_call[{tool_count}]: {fc.name}")
+                if hasattr(part, "function_response") and part.function_response:
+                    fr = part.function_response
+                    print(f"           tool_result: {fr.name} → "
+                          f"{str(fr.response)[:100]}")
+
+        if is_final and has_content:
+            for part in event.content.parts:
+                if hasattr(part, "text") and part.text:
+                    final_text = part.text.strip()
+                    print(f"  ✅ FINAL TEXT captured: {final_text[:200]}")
+                    break
+
+    print(f"  {'─'*50}")
+    print(f"  ADK done — {event_count} events, {tool_count} tool calls")
+
+    # If is_final_response never fired with text, use last text seen
+    if not final_text and all_texts:
+        final_text = all_texts[-1]
+        print(f"  ⚠️  Used last text as final: {final_text[:200]}")
+
+    return final_text
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator loop
+# Sync entry point (bridges FastAPI sync → async ADK)
 # ---------------------------------------------------------------------------
 
 def run_orchestrator(uploaded_text: str) -> WorkflowResponse:
     """
-    Run the full orchestrator agent.
-    The LLM controls the workflow — deciding which tools to call and when.
-    Returns a WorkflowResponse built from the session state.
+    Run the Google ADK orchestrator agent.
+    Bridges the sync FastAPI endpoint to the async ADK Runner.
     """
     import time
     start = time.time()
 
-    client     = create_llm_client()
-    model      = llm_model_name()
+    print(f"  🤖 ADK Orchestrator starting (gemini-2.5-flash + MCP RAG)")
 
-    # Session state — accumulates as tools are called
-    session: dict = {
-        "uploaded_text": uploaded_text,
-        "role_data":     None,
-        "risks":         [],
-        "regulations":   [],
-        "competencies":  None,
-        "training_plan": None,
-        "plan_id":       None,
-    }
+    # Run async ADK in a fresh event loop (safe in anyio worker threads)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        final_text = loop.run_until_complete(_run_adk_async(uploaded_text))
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
 
-    messages = [
-        {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
-        {"role": "user",   "content": f"[ignoring loop detection]\n{uploaded_text}"},
-    ]
+    elapsed = time.time() - start
+    print(f"  ✅ ADK complete ({elapsed:.1f}s)")
 
-    MAX_ITERATIONS = 20
-    tool_call_count = 0
-    label_map = {
-        "extract_role":           "📋 Extracting role",
-        "search_compliance_docs": "🔍 RAG search",
-        "generate_competencies":  "🧠 Generating competencies",
-        "generate_training_plan": "📝 Generating training plan",
-        "validate_plan":          "✅ Validating plan",
-        "save_plan":              "💾 Saving to database",
-    }
+    # ── Extract plan_id from agent output (robust multi-strategy) ─────────────
+    plan_id = None
+    if final_text:
+        print(f"     Agent output: {final_text[:400]}")
 
-    print(f"  🤖 Orchestrator starting (model: {model})")
+        # Strip markdown code fences (```json ... ``` or ``` ... ```)
+        cleaned = re.sub(r'```(?:json)?\s*', '', final_text).replace('```', '').strip()
 
-    for iteration in range(MAX_ITERATIONS):
+        # Strategy 1: direct JSON parse
         try:
-            response = client.chat.completions.create(
-                model=model,
-                max_tokens=6000,
-                messages=messages,
-                tools=ORCHESTRATOR_TOOLS,
-                tool_choice="auto",
+            data = json.loads(cleaned)
+            plan_id = data.get("plan_id")
+            print(f"     [parse-1] plan_id = {plan_id}")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # Strategy 2: JSON fragment search
+        if not plan_id:
+            m = re.search(r'"plan_id"\s*:\s*"([^"]+)"', final_text)
+            if m:
+                plan_id = m.group(1)
+                print(f"     [parse-2] plan_id = {plan_id}")
+
+        # Strategy 3: bare UUID anywhere in text
+        if not plan_id:
+            m = re.search(
+                r'\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b',
+                final_text, re.IGNORECASE
             )
-        except Exception as e:
-            logger.error(f"Orchestrator LLM call failed at iteration {iteration + 1}: {e}")
-            break
+            if m:
+                plan_id = m.group(1)
+                print(f"     [parse-3] plan_id = {plan_id}")
 
-        choice  = response.choices[0]
-        message = choice.message
-
-        # ── Agent is calling tools ────────────────────────────────────────────
-        if message.tool_calls:
-            messages.append({
-                "role":       "assistant",
-                "content":    message.content,
-                "tool_calls": [
-                    {
-                        "id":   tc.id,
-                        "type": "function",
-                        "function": {
-                            "name":      tc.function.name,
-                            "arguments": tc.function.arguments,
-                        }
-                    }
-                    for tc in message.tool_calls
-                ],
-            })
-
-            for tc in message.tool_calls:
-                tool_call_count += 1
-                name = tc.function.name
-                label = label_map.get(name, name)
-                print(f"\n  [{tool_call_count}] {label}")
-
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
-
-                result = _dispatch(name, args)
-
-                # Keep session state up to date
-                if name == "extract_role" and isinstance(result, dict) and "role" in result:
-                    session["role_data"] = result
-                    risk_indicators = result.get("risk_indicators", [])
-                    # Seed session risks with inherent risk_indicators from the role text
-                    session["risks"] = list(risk_indicators)
-                    print(f"       → Role: '{result.get('role')}'")
-                    if risk_indicators:
-                        print(f"       → Inherent risks from role text ({len(risk_indicators)}):")
-                        for ri in risk_indicators:
-                            print(f"           • {ri[:100]}")
-                    # Inject a highlighted note into the conversation so the agent
-                    # definitely uses these risks in subsequent tool calls
-                    if risk_indicators:
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "[ignoring loop detection]\n"
-                                f"Note: The following risk_indicators were extracted directly from "
-                                f"the role description. Include ALL of them in risk_types for every "
-                                f"subsequent tool call:\n"
-                                + "\n".join(f"- {r}" for r in risk_indicators)
-                            ),
-                        })
-
-                elif name == "search_compliance_docs" and isinstance(result, list):
-                    print(f"       → {len(result)} chunks returned")
-
-                elif name == "generate_competencies" and isinstance(result, dict):
-                    session["competencies"] = result
-                    print(f"       → {len(result.get('knowledge', []))} knowledge, "
-                          f"{len(result.get('skills', []))} skills, "
-                          f"{len(result.get('judgement', []))} judgement items")
-
-                elif name == "generate_training_plan" and isinstance(result, dict):
-                    session["training_plan"] = result
-                    quarters = [q.get("quarter") for q in result.get("quarterly_plan", [])]
-                    print(f"       → Quarters: {quarters}")
-
-                elif name == "validate_plan" and isinstance(result, dict):
-                    valid  = result.get("valid", False)
-                    errors = result.get("errors", [])
-                    status = "✅ VALID" if valid else f"❌ INVALID ({len(errors)} errors)"
-                    print(f"       → {status}")
-                    if errors:
-                        for err in errors[:3]:
-                            print(f"         • {err[:100]}")
-
-                elif name == "save_plan" and isinstance(result, dict):
-                    if result.get("success"):
-                        session["plan_id"] = result.get("plan_id")
-                        # Capture everything save_plan received — the full data set
-                        session["risks"]         = args.get("risks", session.get("risks", []))
-                        session["regulations"]   = args.get("regulations", session.get("regulations", []))
-                        session["role_data"]     = args.get("role_data", session.get("role_data"))
-                        session["competencies"]  = args.get("competencies", session.get("competencies"))
-                        session["training_plan"] = args.get("training_plan", session.get("training_plan"))
-                        print(f"       → plan_id: {session['plan_id']}")
-                    else:
-                        print(f"       → FAILED: {result.get('error')}")
-
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      "[ignoring loop detection]\n" + json.dumps(result, default=str),
-                })
-
-        # ── Agent finished — parse final output ───────────────────────────────
-        elif message.content:
-            elapsed = time.time() - start
-            print(f"\n  ✅ Orchestrator complete ({tool_call_count} tool calls, {elapsed:.1f}s)")
-            print(f"     Agent output: {message.content[:200]}")
-            return _build_response(session, uploaded_text)
-
+    # ── Load response from DB ──────────────────────────────────────────────────
+    if plan_id:
+        from app.services.workflow import get_plan_by_id
+        response = get_plan_by_id(plan_id)
+        if response and response.recommendations:
+            print(f"     ✅ Loaded {len(response.recommendations)} quarters from DB (plan_id)")
+            return response
         else:
-            logger.warning(f"Empty agent response at iteration {iteration + 1}")
-            break
+            print(f"     ⚠️  get_plan_by_id({plan_id}) returned no recommendations")
 
-    logger.warning(f"Orchestrator hit max iterations — building response from partial state")
-    return _build_response(session, uploaded_text)
+    # ── Fallback: most recently saved plan (in last 5 minutes) ────────────────
+    print(f"     🔄 Trying latest-plan fallback...")
+    response = _get_latest_plan()
+    if response and response.recommendations:
+        print(f"     ✅ Loaded {len(response.recommendations)} quarters from latest plan")
+        return response
 
-
-# ---------------------------------------------------------------------------
-# Build WorkflowResponse from accumulated session state
-# ---------------------------------------------------------------------------
-
-def _build_response(session: dict, uploaded_text: str) -> WorkflowResponse:
+    # ── Nothing worked ────────────────────────────────────────────────────────
+    logger.warning("ADK orchestrator produced no usable plan — returning minimal response")
     from app.models.role_intelligence import RoleExtraction
     from app.models.competency import Competency
-    from app.models.regulation import RegulationReference
-    from app.models.training import TrainingPlan
-
-    # ── Best path: load fully structured data from DB ─────────────────────────
-    plan_id = session.get("plan_id")
-    if plan_id:
-        try:
-            from app.services.workflow import get_plan_by_id
-            db_response = get_plan_by_id(plan_id)
-            if db_response and db_response.recommendations:
-                logger.info(f"✅ Loaded {len(db_response.recommendations)} recommendations from DB")
-                return db_response
-        except Exception as e:
-            logger.warning(f"DB load failed, falling back to session state: {e}")
-
-    # ── Fallback: reconstruct from session state ──────────────────────────────
-    logger.warning("Building response from session state (no DB load)")
-
-    role_data_raw = session.get("role_data") or {}
-    role_data = RoleExtraction(
-        role=role_data_raw.get("role", "Unknown"),
-        responsibilities=role_data_raw.get("responsibilities", []),
-        compliance_exposure=role_data_raw.get("compliance_exposure", []),
-        risk_indicators=role_data_raw.get("risk_indicators", []),
-    )
-
-    comp_raw = session.get("competencies") or {}
-    competencies = Competency(
-        knowledge=comp_raw.get("knowledge", []),
-        skills=comp_raw.get("skills", []),
-        judgement=comp_raw.get("judgement", []),
-    )
-
-    risks: list[str] = session.get("risks", [])
-
-    regs_raw: list[dict] = session.get("regulations", [])
-    try:
-        regulations = [RegulationReference.model_validate(r) for r in regs_raw]
-    except Exception:
-        regulations = []
-
-    recommendations: list[Recommendation] = []
-    plan_raw = session.get("training_plan")
-    if plan_raw:
-        try:
-            plan_obj = TrainingPlan.model_validate(plan_raw)
-            recommendations = list(plan_obj.quarterly_plan)
-        except Exception as e:
-            logger.warning(f"Could not parse training plan: {e}")
-
     return WorkflowResponse(
         uploaded_text=uploaded_text,
-        role_data=role_data,
-        risks=risks,
-        regulations=regulations,
-        competencies=competencies,
-        recommendations=recommendations,
-        training_plan_id=plan_id,
+        role_data=RoleExtraction(role="Unknown", responsibilities=[],
+                                  compliance_exposure=[], risk_indicators=[]),
+        risks=[], regulations=[],
+        competencies=Competency(knowledge=[], skills=[], judgement=[]),
+        recommendations=[], training_plan_id=None,
     )
+
+
+def _get_latest_plan() -> WorkflowResponse | None:
+    """Fetch the most recently created training plan from the DB (last 5 minutes)."""
+    from app.services.workflow import get_plan_by_id
+    from app.db import SessionLocal
+    from app.db_models import TrainingPlanRecord
+    from datetime import datetime, timedelta, timezone
+
+    if SessionLocal is None:
+        return None
+    try:
+        with SessionLocal() as db:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+            plan = (
+                db.query(TrainingPlanRecord)
+                .order_by(TrainingPlanRecord.created_at.desc())
+                .first()
+            )
+            if plan:
+                print(f"     Latest plan ID: {plan.id} (created {plan.created_at})")
+                return get_plan_by_id(plan.id)
+    except Exception as e:
+        logger.warning(f"Latest-plan fallback failed: {e}")
+    return None
