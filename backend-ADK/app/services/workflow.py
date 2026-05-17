@@ -38,10 +38,48 @@ class WorkflowState(TypedDict, total=False):
 
 def run_training_workflow(uploaded_text: str) -> WorkflowResponse:
     """
-    Training Workflow using LLM + RAG with PERFORMANCE OPTIMIZATIONS
+    Entry point — delegates to the Orchestrator Agent which controls the full workflow.
     """
     import time
     workflow_start = time.time()
+
+    # --- Fast input validation (before any LLM cost) ---
+    if not uploaded_text or not uploaded_text.strip():
+        raise ValueError("Input text cannot be empty")
+    if len(uploaded_text.strip()) < 20:
+        raise ValueError("Input is too short. Please provide a detailed role description (minimum 20 characters)")
+    if len(uploaded_text.strip().split()) < 3:
+        raise ValueError("Input is too brief. Please provide a complete role description with responsibilities")
+
+    role_keywords = [
+        'analyst', 'officer', 'manager', 'advisor', 'specialist', 'director',
+        'investigator', 'coordinator', 'supervisor', 'consultant', 'executive',
+        'responsible', 'duties', 'tasks', 'role', 'position', 'job', 'work',
+        'monitoring', 'compliance', 'kyc', 'aml', 'risk', 'due diligence',
+        'customer', 'investigation', 'screening', 'reporting', 'oversight'
+    ]
+    if not any(kw in uploaded_text.lower() for kw in role_keywords):
+        raise ValueError(
+            "Input does not appear to be a role description. "
+            "Please provide information about a job role with responsibilities "
+            "(e.g., 'KYC Analyst responsible for customer due diligence and screening')"
+        )
+
+    print(f"\n{'='*60}")
+    print(f"🤖 ORCHESTRATOR MODE — LLM-driven adaptive workflow")
+    print(f"{'='*60}")
+
+    from app.services.orchestrator import run_orchestrator
+    result = run_orchestrator(uploaded_text)
+
+    total_time = time.time() - workflow_start
+    print(f"\n{'='*60}")
+    print(f"🎯 WORKFLOW COMPLETE — Total: {total_time:.1f}s")
+    print(f"{'='*60}\n")
+
+    return result
+
+
     
     # --- Input Validation ---
     if not uploaded_text or not uploaded_text.strip():
@@ -92,77 +130,48 @@ def run_training_workflow(uploaded_text: str) -> WorkflowResponse:
     print(f"\n{'='*60}")
     print(f"[STAGE 2/6] ⚡ Parallel RAG: Risks + Regulations...")
     print(f"{'='*60}")
+    from app.services.agentic_rag import run_agentic_rag
     import re as _re
     import time
 
     rag_start = time.time()
 
-    REG_QUERIES = [
-        "AMLR Article 11 compliance officer obligations",
-        "AMLR Article 20 customer due diligence requirements",
-        "AMLR Article 33 training awareness staff",
-        "AMLR Article 15 risk assessment monitoring",
-        "AMLR Article 69 record keeping reporting",
-    ]
+    # --- AGENTIC RAG: LLM autonomously decides what to search ---
+    agent_result = run_agentic_rag(
+        role_name=role_data.role,
+        responsibilities=role_data.responsibilities,
+    )
 
-    # --- Sequential RAG calls (reliable; parallel deadlocks inside anyio threads) ---
-    print("  Fetching risks...")
-    risks: list[str] = []
-    try:
-        raw = mcp_client.search_docs(query=f"compliance risks for {state['role_data'].get('role', '')}")
-        for r in (raw if isinstance(raw, list) else []):
-            t = r.get('text', '')
-            t = (t[:150] + '...') if len(t) > 150 else t
-            if '. ' in t:
-                t = t.split('. ')[0] + '.'
-            risks.append(t)
-    except Exception as e:
-        logger.error(f"Risk fetch failed: {e}")
+    risks: list[str] = agent_result.get("risks", [])
+    raw_reg_results: list[dict] = agent_result.get("regulations", [])
 
-    print(f"  Got {len(risks)} risks. Fetching regulations...")
-    raw_reg_results: list[dict] = []
-    for i, query in enumerate(REG_QUERIES, 1):
-        print(f"  Reg {i}/{len(REG_QUERIES)}: {query[:50]}...")
-        try:
-            raw = mcp_client.search_docs(query=query)
-            for r in (raw if isinstance(raw, list) else [])[:2]:
-                text = r.get('text', '').strip()
-                if not text:
-                    continue
-                nums = _re.findall(r'Article\s+(\d+)', text)
-                article_num = nums[0] if nums else None
-                if not article_num:
-                    m = _re.search(r'Article\s+(\d+)', query)
-                    article_num = m.group(1) if m else None
-                sentences = [s.strip() for s in text.split('.') if s.strip()]
-                snippet = next(
-                    (s for s in sentences if article_num and f'Article {article_num}' in s),
-                    sentences[0] if sentences else text
-                )[:200]
-                raw_reg_results.append({
-                    "article_num": article_num,
-                    "article_label": f"Article {article_num}" if article_num else None,
-                    "snippet": snippet,
-                })
-        except Exception as e:
-            logger.warning(f"Regulation query failed: {e}")
+    print(f"  Got {len(risks)} risks.")
+    for i, r in enumerate(risks, 1):
+        print(f"    {i}. {r[:120]}")
 
-    # Deduplicate
+    # Deduplicate regulations
     seen_nums: set[str] = set()
     regs: list[dict] = []
     for item in raw_reg_results:
         if len(regs) >= 6:
             break
-        num = item["article_num"]
+        num   = item.get("article_num", "")
+        label = item.get("article_label") or (f"Article {num}" if num else None)
         if num and num in seen_nums:
             continue
-        label = item["article_label"] or f"AMLR Requirement {len(regs) + 1}"
-        regs.append({"article": label, "title": "AMLR 2024/1624",
-                     "requirements": [item["snippet"]], "keywords": [], "risk_types": []})
+        if not label:
+            continue
+        regs.append({
+            "article":      label,
+            "title":        "AMLR 2024/1624",
+            "requirements": [item.get("snippet", "")],
+            "keywords":     [],
+            "risk_types":   [],
+        })
         if num:
             seen_nums.add(num)
 
-    # Fallback
+    # Fallback — guarantee at least 4 articles if agent returned few/none
     for num, desc in [
         ("11", "Compliance manager obligations — appoint compliance manager responsible for AML/CFT adherence"),
         ("20", "Customer due diligence — verify customer identity and monitor business relationships"),
@@ -174,14 +183,20 @@ def run_training_workflow(uploaded_text: str) -> WorkflowResponse:
             break
         if num not in seen_nums:
             seen_nums.add(num)
-            regs.append({"article": f"Article {num}", "title": "AMLR 2024/1624",
-                         "requirements": [desc], "keywords": [], "risk_types": []})
+            regs.append({
+                "article":      f"Article {num}",
+                "title":        "AMLR 2024/1624",
+                "requirements": [desc],
+                "keywords":     [],
+                "risk_types":   [],
+            })
 
     rag_time = time.time() - rag_start
     print(f"  ✅ RAG done — {len(risks)} risks, {len(regs)} articles ({rag_time:.2f}s)")
     print(f"     Articles: {[r['article'] for r in regs]}")
     state['risks'] = risks
     state['regulations'] = regs
+
 
     # --- 4. Competency Generation ---
     print(f"\n{'='*60}")

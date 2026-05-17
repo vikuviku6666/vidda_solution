@@ -78,7 +78,8 @@ class MCPRAGClient:
             "params": {
                 "name": "search_docs",
                 "arguments": {
-                    "query": query
+                    "query": query,
+                    "top_k": 5
                 }
             }
         }
